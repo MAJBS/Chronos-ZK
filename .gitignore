@@ -1,0 +1,49 @@
+# Rust build artifacts
+core_pruner/target/
+**/target/
+Cargo.lock
+
+# C++ / CUDA binaries and intermediate files (Windows & Linux/macOS)
+*.exe
+*.exp
+*.lib
+*.pdb
+*.obj
+*.o
+*.tmp
+*.tmp.json
+tmpxft_*
+cuda_pruner/*.exe
+cuda_pruner/*.exp
+cuda_pruner/*.lib
+cuda_pruner/zk_megakernel
+
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Generated intermediate contracts and exploit payloads
+pruned_ir.json
+exploit_poc.json
+telemetry_results.json
+GRANT_BENCHMARK_REPORT.md
+
+# IDE / Operating System artifacts
+.vscode/
+.vs/
+*.suo
+*.user
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
+# External Benchmarks & Local Workspace Utilities
+benchmarks/zkbugs/
+benchmarks/panther-core-vuln/
+_.txt
+crear_contexto.py
+project_context.txt

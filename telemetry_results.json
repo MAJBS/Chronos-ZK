@@ -1,0 +1,46 @@
+[
+  {
+    "tier_name": "Tier 1: Micro-Circuito",
+    "constraints": 50,
+    "z3_pure_ms": 25.227600010111928,
+    "z3_status": "SUCCESS",
+    "rust_cpu_ms": 9.394599997904152,
+    "cuda_gpu_ms": 0.5513,
+    "speedup_vs_z3": 45.76,
+    "speedup_cuda_vs_rust": 17.04,
+    "alu_cycles": 20294
+  },
+  {
+    "tier_name": "Tier 2: Circuito Medio",
+    "constraints": 1000,
+    "z3_pure_ms": 218.886399990879,
+    "z3_status": "SUCCESS",
+    "rust_cpu_ms": 7.86,
+    "cuda_gpu_ms": 0.2103,
+    "speedup_vs_z3": 1040.83,
+    "speedup_cuda_vs_rust": 37.38,
+    "alu_cycles": 11503
+  },
+  {
+    "tier_name": "Tier 3: Circuito Critico",
+    "constraints": 10000,
+    "z3_pure_ms": 2307.488699996611,
+    "z3_status": "SUCCESS",
+    "rust_cpu_ms": 410.09,
+    "cuda_gpu_ms": 0.2089,
+    "speedup_vs_z3": 11045.9,
+    "speedup_cuda_vs_rust": 1963.09,
+    "alu_cycles": 184005
+  },
+  {
+    "tier_name": "Tier 4: Escala Produccion",
+    "constraints": 50000,
+    "z3_pure_ms": 11535.210100002587,
+    "z3_status": "SUCCESS",
+    "rust_cpu_ms": 8260.0,
+    "cuda_gpu_ms": 0.2231,
+    "speedup_vs_z3": 51704.21,
+    "speedup_cuda_vs_rust": 37023.76,
+    "alu_cycles": 1812829
+  }
+]

@@ -1,0 +1,8 @@
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.rs text eol=lf
+*.cu text eol=lf
+*.circom text eol=lf
+*.bat text eol=crlf
+*.r1cs binary

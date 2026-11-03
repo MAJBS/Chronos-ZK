@@ -1,0 +1,17 @@
+% Tabla de benchmarking generada automaticamente por Chronos-ZK
+\begin{table}[htbp]
+\centering
+\small
+\caption{Comparativa trilateral de rendimiento: Z3 Puro CPU vs. Chronos-ZK Rust vs. Chronos-ZK CUDA.}
+\label{tab:chronos_zk_benchmarks}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lrrrrr@{}}
+\toprule
+\textbf{Regimen de Escala} & \textbf{Restricciones ($M$)} & \textbf{Z3 Puro CPU} & \textbf{Chronos-ZK (.rs)} & \textbf{Chronos-ZK (.cu)} & \textbf{Aceleracion} \\
+\midrule
+Tier 1: Micro-Circuito & 50 & 95.9 ms & 9.69 ms & \textbf{0.4251 ms} & \textbf{225.63x} \\
+Tier 2: Circuito Medio & 1,000 & 1489.5 ms & 12.07 ms & \textbf{0.4196 ms} & \textbf{3549.87x} \\
+Tier 3: Circuito Critico & 10,000 & 1400.0 ms & 113.21 ms & \textbf{0.9065 ms} & \textbf{1544.35x} \\
+Tier 4: Escala Produccion & 50,000 & 1372.7 ms & 573.49 ms & \textbf{0.3781 ms} & \textbf{3630.42x} \\
+\bottomrule
+\end{tabular*}
+\end{table}
