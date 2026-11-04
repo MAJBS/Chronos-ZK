@@ -3,8 +3,8 @@
 //! Modulo: core_pruner/src/r1cs_parser.rs
 //! Proposito: Ingesta sin dependencias externas de:
 //!            1. Binarios oficiales Iden3 `.r1cs` v1 (Little-Endian 256-bit)
-//!            2. Archivos `.circom` 2.0/2.1 (soporte de tags `{binary}`,
-//!               asignaciones inline `signal x <== ...` vs `signal x <-- ...`)
+//!            2. Archivos `.circom` con resolucion recursiva de `include`,
+//!               soporte de tags `{binary}` y rastreo de hints `<--` vs `<==`
 //!            3. Contratos JSON (`Chronos-IR`, `SnarkJS` y `R1CSCircuit`)
 //!            4. Tablas de simbolos `.sym` de Circom (`load_sym_file`)
 //! ===========================================================================
@@ -12,10 +12,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const BN254_PRIME: &str =
     "21888242871839275222246405745257275088548364400416034343698204186575808495617";
@@ -80,9 +80,6 @@ impl R1CSCircuit {
     }
 }
 
-/// Carga un archivo `.sym` oficial generado por `circom --r1cs --sym`
-/// (Formato CSV: label_id,wire_id,component_id,symbol_name) y retorna
-/// la cantidad de cables mapeados.
 pub fn load_sym_file(circuit: &mut R1CSCircuit, sym_path: &str) -> usize {
     let file = match File::open(sym_path) {
         Ok(f) => f,
@@ -102,7 +99,9 @@ pub fn load_sym_file(circuit: &mut R1CSCircuit, sym_path: &str) -> usize {
                 if wire_id >= 0 && (wire_id as usize) < circuit.num_variables {
                     let sym_name = parts[3].trim().to_string();
                     if !sym_name.is_empty() {
-                        circuit.wire_to_symbol.insert(wire_id as usize, sym_name.clone());
+                        circuit
+                            .wire_to_symbol
+                            .insert(wire_id as usize, sym_name.clone());
                         circuit.signal_names.insert(sym_name, wire_id as usize);
                         loaded += 1;
                     }
@@ -167,7 +166,7 @@ fn sanitize_identifier(raw: &str) -> String {
             c.is_whitespace()
                 || matches!(
                     c,
-                    '+' | '-' | '*' | '/' | '&' | '|' | '?' | ':' | '<' | '>' | '(' | ')'
+                    '+' | '-' | '*' | '/' | '\\' | '%' | '&' | '|' | '^' | '?' | ':' | '<' | '>' | '(' | ')' | ','
                 )
         })
         .find(|s| !s.is_empty())
@@ -182,6 +181,89 @@ fn sanitize_identifier(raw: &str) -> String {
         return String::new();
     }
     token.to_string()
+}
+
+/// Extrae todos los identificadores de seniales existentes en una expresion `rhs`.
+fn extract_known_signals_from_expr(expr: &str, circuit: &R1CSCircuit) -> Vec<usize> {
+    let mut found = Vec::new();
+    for raw_tok in expr.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '+' | '-' | '*' | '/' | '\\' | '%' | '&' | '|' | '^' | '?' | ':' | '<' | '>' | '(' | ')' | '[' | ']' | ',' | ';'
+            )
+    }) {
+        let tok = raw_tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some(&id) = circuit.signal_names.get(tok) {
+            if id != 0 && !found.contains(&id) {
+                found.push(id);
+            }
+        } else {
+            // Probar indice base de arreglo `arr_0` si `tok` fue nombre de arreglo
+            let arr_zero = format!("{}_0", tok);
+            if let Some(&id) = circuit.signal_names.get(&arr_zero) {
+                if id != 0 && !found.contains(&id) {
+                    found.push(id);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Carga un archivo `.circom` expandiendo recursivamente sus directivas `include "..."`
+/// cuando existen en el sistema de archivos local.
+fn load_circom_lines_with_includes(
+    filepath: &Path,
+    visited: &mut HashSet<PathBuf>,
+    depth: usize,
+) -> Vec<String> {
+    if depth > 4 {
+        return Vec::new();
+    }
+    if let Ok(canon) = filepath.canonicalize() {
+        if visited.contains(&canon) {
+            return Vec::new();
+        }
+        visited.insert(canon);
+    }
+
+    let file = match File::open(filepath) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let mut raw_lines = Vec::new();
+    for l in reader.lines().map_while(Result::ok) {
+        raw_lines.push(l);
+    }
+
+    let parent_dir = filepath.parent().unwrap_or_else(|| Path::new("."));
+    let mut expanded_lines = Vec::new();
+
+    for line in &raw_lines {
+        let trimmed = strip_inline_comment(line).trim();
+        if trimmed.starts_with("include") {
+            if let Some(first_q) = trimmed.find('"') {
+                if let Some(second_q) = trimmed[first_q + 1..].find('"') {
+                    let rel_inc = &trimmed[first_q + 1..first_q + 1 + second_q];
+                    let inc_path = parent_dir.join(rel_inc);
+                    if inc_path.exists() {
+                        let sub_lines =
+                            load_circom_lines_with_includes(&inc_path, visited, depth + 1);
+                        expanded_lines.extend(sub_lines);
+                        continue;
+                    }
+                }
+            }
+        }
+        expanded_lines.push(line.clone());
+    }
+
+    expanded_lines
 }
 
 // ===========================================================================
@@ -422,12 +504,8 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
         }
     }
 
-    let file = File::open(filepath)?;
-    let reader = BufReader::new(file);
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        lines.push(line?);
-    }
+    let mut visited = HashSet::new();
+    let lines = load_circom_lines_with_includes(Path::new(filepath), &mut visited, 0);
 
     let mut main_template = String::new();
     let mut main_param: Option<usize> = None;
@@ -456,7 +534,8 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
                     main_template = rhs[..paren_open].trim().to_string();
                     if let Some(paren_close) = rhs[paren_open..].find(')') {
                         let arg_str = rhs[paren_open + 1..paren_open + paren_close].trim();
-                        if let Ok(val) = arg_str.parse::<usize>() {
+                        let first_arg = arg_str.split(',').next().unwrap_or("").trim();
+                        if let Ok(val) = first_arg.parse::<usize>() {
                             main_param = Some(val);
                         }
                     }
@@ -505,6 +584,7 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
 
     let mut in_target_template = false;
     let param_val = main_param.unwrap_or(8);
+    let mut unconstrained_hints: Vec<usize> = Vec::new();
 
     for raw_line in &lines {
         let trimmed = strip_inline_comment(raw_line).trim().to_string();
@@ -516,12 +596,10 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() > 1 {
                 let t_name = parts[1].split('(').next().unwrap_or("Circuit").to_string();
-                if main_template.is_empty() || t_name == main_template {
-                    in_target_template = true;
+                if main_template.is_empty() || t_name == main_template || circuit.num_variables == 1 {
                     circuit.name = t_name;
-                } else {
-                    in_target_template = false;
                 }
+                in_target_template = true;
             }
             continue;
         }
@@ -613,11 +691,36 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
             }
         }
 
+        // Detectar asignaciones sin restriccion `<--` (Hints de testigo potenciales bugs!)
+        if trimmed.contains("<--") {
+            if let Some(lhs_raw) = trimmed.split("<--").next() {
+                let lhs_clean = lhs_raw
+                    .replace("signal output", "")
+                    .replace("signal input", "")
+                    .replace("signal ", "");
+                let hint_id = circuit.alloc_signal(&lhs_clean);
+                if hint_id != 0 && !unconstrained_hints.contains(&hint_id) {
+                    unconstrained_hints.push(hint_id);
+                }
+            }
+        }
+
         if trimmed.contains("===") {
             parse_constraint_expression(&trimmed, &mut circuit);
         } else if trimmed.contains("<==") {
             parse_assignment_constraint(&trimmed, &mut circuit);
         }
+    }
+
+    // Si hay hints `<--` en el circuito, asegurar que sean evaluados por el Francotirador
+    for h_id in unconstrained_hints {
+        if !circuit.output_signals.contains(&h_id) {
+            circuit.output_signals.push(h_id);
+        }
+    }
+
+    if circuit.output_signals.is_empty() && !circuit.private_inputs.is_empty() {
+        circuit.output_signals = circuit.private_inputs.clone();
     }
 
     Ok(circuit)
@@ -880,13 +983,20 @@ fn parse_constraint_expression(line: &str, circuit: &mut R1CSCircuit) {
                 }
             }
         }
-    } else if !left.is_empty() && !right.is_empty() && right != "0" {
+    } else if !left.is_empty() && !right.is_empty() {
         let id_l = circuit.alloc_signal(&left);
         let id_r = circuit.alloc_signal(&right);
         if id_l != 0 && id_r != 0 {
             circuit.constraints.push(SparseConstraint {
                 a: vec![(0, "1".to_string())],
                 b: vec![(id_r, "1".to_string())],
+                c: vec![(id_l, "1".to_string())],
+            });
+        } else if id_l != 0 && right.chars().all(|c| c.is_ascii_digit()) {
+            // Igualdad con constante escalar: `sig === const` (ej. `out === 1` o `out === 0`)
+            circuit.constraints.push(SparseConstraint {
+                a: vec![(0, "1".to_string())],
+                b: vec![(0, right)],
                 c: vec![(id_l, "1".to_string())],
             });
         }
@@ -929,21 +1039,41 @@ fn parse_assignment_constraint(line: &str, circuit: &mut R1CSCircuit) {
             let id1 = circuit.alloc_signal(factors[0].trim());
             let id2 = circuit.alloc_signal(factors[1].trim());
             let out_id = circuit.alloc_signal(&left_clean);
-            circuit.constraints.push(SparseConstraint {
-                a: vec![(id1, "1".to_string())],
-                b: vec![(id2, "1".to_string())],
-                c: vec![(out_id, "1".to_string())],
-            });
+            if id1 != 0 && id2 != 0 && out_id != 0 {
+                circuit.constraints.push(SparseConstraint {
+                    a: vec![(id1, "1".to_string())],
+                    b: vec![(id2, "1".to_string())],
+                    c: vec![(out_id, "1".to_string())],
+                });
+            }
         }
     } else {
+        // Extraer las seniales reales referenciadas en el lado derecho `right`:
+        // `out_id` solo quedara determinada si TODAS las seniales en `rhs_vars` estan determinadas.
         let out_id = circuit.alloc_signal(&left_clean);
-        let anchor_id = circuit.public_inputs.first().copied().unwrap_or(0);
         if out_id != 0 {
-            circuit.constraints.push(SparseConstraint {
-                a: vec![(0, "1".to_string())],
-                b: vec![(anchor_id, "1".to_string())],
-                c: vec![(out_id, "1".to_string())],
-            });
+            let rhs_vars = extract_known_signals_from_expr(&right, circuit);
+            if !rhs_vars.is_empty() {
+                let b_terms: Vec<(usize, String)> = rhs_vars
+                    .into_iter()
+                    .filter(|&id| id != out_id)
+                    .map(|id| (id, "1".to_string()))
+                    .collect();
+                if !b_terms.is_empty() {
+                    circuit.constraints.push(SparseConstraint {
+                        a: vec![(0, "1".to_string())],
+                        b: b_terms,
+                        c: vec![(out_id, "1".to_string())],
+                    });
+                }
+            } else {
+                let anchor_id = circuit.public_inputs.first().copied().unwrap_or(0);
+                circuit.constraints.push(SparseConstraint {
+                    a: vec![(0, "1".to_string())],
+                    b: vec![(anchor_id, "1".to_string())],
+                    c: vec![(out_id, "1".to_string())],
+                });
+            }
         }
     }
 }

@@ -32,7 +32,7 @@ def discover_circuit_files(target_path: str) -> list:
         dirs[:] = [
             d
             for d in dirs
-            if d not in (".git", ".venv", "venv", "target", "node_modules", "__pycache__")
+            if d not in (".git", ".venv", "venv", "target", "node_modules", "__pycache__", "dependencies")
         ]
         for fname in sorted(files):
             if fname.endswith((".r1cs", ".circom", ".snarkjs.json")):
