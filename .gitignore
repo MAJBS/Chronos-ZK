@@ -32,6 +32,8 @@ exploit_poc.json
 telemetry_results.json
 GRANT_BENCHMARK_REPORT.md
 
+BOUNTY_SCAN_REPORT.md
+
 # IDE / Operating System artifacts
 .vscode/
 .vs/
