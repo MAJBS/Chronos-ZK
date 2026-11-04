@@ -2,11 +2,9 @@
 //! CHRONOS-ZK: PROPAGADOR COINDUCTIVO EN EL BILATTICE PARACONSISTENTE L4
 //! Modulo: core_pruner/src/l4_propagator.rs
 //! Proposito: Evaluacion de punto fijo de Kleene en tiempo lineal O(|V|+|E|)
-//!            mediante cola de propagacion (BFS Worklist) sobre los 4 estados:
-//!            - Void      (00): Libre / Indeterminado en F_p
-//!            - False     (01): Acotado a raices discretas {0, 1} (booleano)
-//!            - True      (10): Funcionalmente determinado por entradas publicas
-//!            - Dialeteia (11): Sintesis completa (01 | 10 = 11)
+//!            con Clausura Funcional Cuadratica Universal (capaz de colapsar
+//!            hashes Poseidon x^5, MiMC y gadgets deterministas) y clasificador
+//!            forense de patrones de vulnerabilidad.
 //! ===========================================================================
 
 use crate::r1cs_parser::{R1CSCircuit, SparseConstraint};
@@ -58,6 +56,7 @@ pub struct L4State {
     pub determined_signals: HashSet<usize>,
     pub boolean_bounded_signals: HashSet<usize>,
     pub malleable_candidates: Vec<usize>,
+    pub vulnerability_patterns: HashMap<usize, String>,
     pub iterations: usize,
 }
 
@@ -84,6 +83,7 @@ impl L4State {
             determined_signals,
             boolean_bounded_signals,
             malleable_candidates: Vec::new(),
+            vulnerability_patterns: HashMap::new(),
             iterations: 0,
         }
     }
@@ -148,14 +148,19 @@ pub fn propagate_l4_fixed_point(circuit: &R1CSCircuit) -> L4State {
     let mut state = L4State::new(circuit.num_variables, &circuit.public_inputs);
     let n_vars = std::cmp::max(circuit.num_variables, 1);
 
-    // 1. Pre-indexar igualdades lineales de 2 variables `1 * x === y` en lista de adyacencia
-    //    para propagacion BFS estrictamente O(|V| + |E|), y separar restricciones complejas.
     let mut linear_adj: Vec<Vec<usize>> = vec![Vec::new(); n_vars];
+    let mut signal_occurrence_count: Vec<usize> = vec![0; n_vars];
     let mut bilinear_zeros: HashSet<(usize, usize)> = HashSet::new();
     let mut mux_signals: HashMap<usize, (usize, usize, usize)> = HashMap::new();
     let mut complex_constraints: Vec<&SparseConstraint> = Vec::new();
 
     for c in &circuit.constraints {
+        for (id, coeff) in c.a.iter().chain(c.b.iter()).chain(c.c.iter()) {
+            if *id > 0 && *id < n_vars && coeff != "0" {
+                signal_occurrence_count[*id] += 1;
+            }
+        }
+
         if let Some(bool_sig) = detect_boolean_check(c) {
             state.apply_transition(bool_sig, Belnap::False);
             continue;
@@ -170,7 +175,6 @@ pub fn propagate_l4_fixed_point(circuit: &R1CSCircuit) -> L4State {
         let is_a_unit = c.a.len() == 1 && c.a[0].0 == 0;
         let is_b_unit = c.b.len() == 1 && c.b[0].0 == 0;
 
-        // Igualdad lineal directa 1 * s1 === s2
         if is_a_unit && c.b.len() == 1 && c.c.len() == 1 {
             let s1 = c.b[0].0;
             let s2 = c.c[0].0;
@@ -207,7 +211,6 @@ pub fn propagate_l4_fixed_point(circuit: &R1CSCircuit) -> L4State {
         complex_constraints.push(c);
     }
 
-    // Funcion auxiliar para propagar determinismo en O(|V|+|E|) por la red de adyacencia lineal
     let propagate_bfs = |st: &mut L4State| -> bool {
         let mut queue: VecDeque<usize> = st.determined_signals.iter().copied().collect();
         let mut any_new = false;
@@ -361,6 +364,40 @@ pub fn propagate_l4_fixed_point(circuit: &R1CSCircuit) -> L4State {
                     }
                 }
             }
+
+            // REGLA 6 (MODO FRANCOTIRADOR): Clausura Funcional Cuadratica Universal
+            // En cualquier restriccion <A, w> * <B, w> == <C, w>:
+            // Si el 100% de las variables en A y en B estan determinadas, el producto
+            // izquierdo es una constante conocida. Si en C todas las variables salvo
+            // una unica variable `u` estan determinadas, `u` queda univocamente fijada
+            // (al dividir por su coeficiente constante c_u != 0 en F_p).
+            // Esto colapsa automaticamente esponjas Poseidon (x^5), MiMC y Pedersen.
+            if !c.c.is_empty() {
+                let all_a_det = c
+                    .a
+                    .iter()
+                    .all(|(id, coeff)| *id == 0 || coeff == "0" || state.signal_values[*id].is_determined());
+                let all_b_det = c
+                    .b
+                    .iter()
+                    .all(|(id, coeff)| *id == 0 || coeff == "0" || state.signal_values[*id].is_determined());
+
+                if all_a_det && all_b_det {
+                    let mut undet_c = Vec::new();
+                    for (id, coeff) in &c.c {
+                        if *id != 0 && coeff != "0" && !state.signal_values[*id].is_determined() {
+                            if !undet_c.contains(id) {
+                                undet_c.push(*id);
+                            }
+                        }
+                    }
+                    if undet_c.len() == 1 {
+                        if state.apply_transition(undet_c[0], Belnap::True) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
         }
 
         if changed {
@@ -368,10 +405,21 @@ pub fn propagate_l4_fixed_point(circuit: &R1CSCircuit) -> L4State {
         }
     }
 
+    // Clasificacion forense de cada senial no determinada (Sniper Triage)
     let pub_set: HashSet<usize> = circuit.public_inputs.iter().copied().collect();
     for i in 1..circuit.num_variables {
         if !pub_set.contains(&i) && !state.signal_values[i].is_determined() {
             state.malleable_candidates.push(i);
+            let pattern = if signal_occurrence_count[i] == 0 {
+                "ORPHAN_UNCONSTRAINED_SIGNAL (0 constraints)".to_string()
+            } else if state.signal_values[i].is_root_bounded() {
+                "UNCOUPLED_BOOLEAN_SIGNAL (bounded to {0,1} but free)".to_string()
+            } else if signal_occurrence_count[i] == 1 {
+                "SINGLE_OCCURRENCE_SLACK_SIGNAL (1 constraint)".to_string()
+            } else {
+                "UNDERCONSTRAINED_NONLINEAR_WITNESS".to_string()
+            };
+            state.vulnerability_patterns.insert(i, pattern);
         }
     }
 

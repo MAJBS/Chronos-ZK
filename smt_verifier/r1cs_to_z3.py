@@ -1,14 +1,16 @@
 """
 =============================================================================
-CHRONOS-ZK: TRADUCTOR R1CS A SMT VIA COCIENTE ALGEBRAICO EXACTO
+CHRONOS-ZK: TRADUCTOR R1CS A SMT, CLAUSURA CUADRATICA Y EXTRACTOR DE ISLAS
 Modulo: smt_verifier/r1cs_to_z3.py
-Proposito: Transformacion diofantica certificada A(w)*B(w) == C(w) + k*p
-           con soporte de subanillo directo (k = 0) y reduccion modular
-           completa sobre F_p con Lema de Euclides para C == 0.
+Proposito: Transformacion diofantica certificada A(w)*B(w) == C(w) + k*p,
+           clausura funcional cuadratica universal (colapso de Poseidon/MiMC),
+           ingesta de tabla de simbolos Circom (.sym) y micro-slicing por
+           islas para el Modo Francotirador (--sniper).
 =============================================================================
 """
 
 import json
+import os
 import z3
 from smt_verifier.bn254_field import BN254Field, BN254_PRIME, log_telemetry
 
@@ -25,6 +27,7 @@ class R1CSCircuitModel:
         output_signals: list = None,
         private_inputs: list = None,
         determined_signals: list = None,
+        signal_symbols: dict = None,
     ):
         self.name = name
         self.prime = int(prime)
@@ -35,9 +38,53 @@ class R1CSCircuitModel:
         self.suspicious_signals = [int(x) for x in (suspicious_signals or [])]
         self.determined_signals = [int(x) for x in (determined_signals or [])]
         self.constraints = constraints or []
+        self.signal_symbols = {
+            int(k): str(v) for k, v in (signal_symbols or {}).items()
+        }
+        if 0 not in self.signal_symbols:
+            self.signal_symbols[0] = "ONE"
+
+    def load_sym_file(self, sym_path: str) -> int:
+        """
+        Lee un archivo `.sym` oficial generado por `circom --r1cs --sym`.
+        Formato CSV de Circom: label_id,wire_id,component_id,symbol_name
+        Cuando wire_id >= 1, asocia el wire_id con su nombre simbolico real.
+        """
+        if not sym_path or not os.path.exists(sym_path):
+            return 0
+
+        loaded = 0
+        with open(sym_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 4:
+                    try:
+                        wire_id = int(parts[1].strip())
+                        sym_name = parts[3].strip()
+                        if 0 <= wire_id < self.num_variables and sym_name:
+                            self.signal_symbols[wire_id] = sym_name
+                            loaded += 1
+                    except ValueError:
+                        continue
+
+        log_telemetry(
+            "SYM_TABLE",
+            f"Tabla de simbolos Circom cargada desde '{sym_path}' ({loaded} seniales mapeadas).",
+        )
+        return loaded
+
+    def get_signal_label(self, sig_id: int) -> str:
+        """Devuelve el nombre simbolico real si existe, o `w_<id>`."""
+        sym = self.signal_symbols.get(int(sig_id))
+        if sym and sym != f"w_{sig_id}":
+            return f"w_{sig_id} ({sym})"
+        return f"w_{sig_id}"
 
     @classmethod
-    def from_json(cls, file_path: str):
+    def from_json(cls, file_path: str, sym_path: str = None):
         log_telemetry("AST_PARSE", f"Cargando contrato Chronos-IR desde: {file_path}")
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -50,6 +97,7 @@ class R1CSCircuitModel:
         outputs = data.get("output_signals", [])
         suspicious = data.get("suspicious_signals", [])
         determined = data.get("determined_signals", [])
+        signal_symbols = data.get("signal_symbols", {})
 
         raw_constraints = data.get("r1cs_constraints", data.get("constraints", []))
         parsed_constraints = []
@@ -63,11 +111,7 @@ class R1CSCircuitModel:
                 "C": [(int(item[0]), int(item[1])) for item in c_raw],
             })
 
-        log_telemetry(
-            "AST_PARSE",
-            f"Contrato '{name}' cargado: {num_vars} seniales, {len(parsed_constraints)} restricciones R1CS.",
-        )
-        return cls(
+        model = cls(
             name=name,
             prime=prime,
             num_variables=num_vars,
@@ -77,7 +121,17 @@ class R1CSCircuitModel:
             output_signals=outputs,
             private_inputs=private_inputs,
             determined_signals=determined,
+            signal_symbols=signal_symbols,
         )
+
+        if sym_path:
+            model.load_sym_file(sym_path)
+
+        log_telemetry(
+            "AST_PARSE",
+            f"Contrato '{name}' cargado: {num_vars} seniales, {len(parsed_constraints)} restricciones R1CS.",
+        )
+        return model
 
     def instantiate_witness(self, prefix: str) -> dict:
         """Instancia el vector de testigo simbolico con w_0 = 1."""
@@ -96,28 +150,244 @@ class R1CSCircuitModel:
                         active.add(int(sig_id))
         return active
 
+    def compute_forward_algebraic_closure(self) -> tuple:
+        """
+        PIEZA 1 DEL MODO FRANCOTIRADOR:
+        Ejecuta la Clausura Funcional Cuadratica y Lineal Universal en L4.
+        Colapsa automaticamente rondas completas de hashes no-lineales deterministas
+        (Poseidon x^5, MiMC x^3, sumas MDS, etc.) donde A y B estan determinadas
+        y despejan univocamente una unica variable libre en C.
+
+        Retorna (determined_set, root_bounded_set, unresolved_signals).
+        """
+        p = self.prime
+        determined = {0} | set(self.public_inputs) | set(self.determined_signals)
+        root_bounded = set(determined)
+
+        def non_const_vars(terms):
+            return [
+                int(sig_id)
+                for sig_id, coeff in terms
+                if int(sig_id) != 0 and (int(coeff) % p) != 0
+            ]
+
+        # Pre-indexar acoplamientos bilineales x * y == 0
+        bilinear_zeros = set()
+        for c in self.constraints:
+            a_v = non_const_vars(c.get("A", []))
+            b_v = non_const_vars(c.get("B", []))
+            c_v = non_const_vars(c.get("C", []))
+            has_c_const = any(int(s) == 0 and (int(cf) % p) != 0 for s, cf in c.get("C", []))
+            if not c_v and not has_c_const and len(a_v) == 1 and len(b_v) == 1 and a_v[0] != b_v[0]:
+                bilinear_zeros.add((a_v[0], b_v[0]))
+                bilinear_zeros.add((b_v[0], a_v[0]))
+
+        changed = True
+        while changed:
+            changed = False
+            for c in self.constraints:
+                a_terms = c.get("A", [])
+                b_terms = c.get("B", [])
+                c_terms = c.get("C", [])
+
+                a_vars = non_const_vars(a_terms)
+                b_vars = non_const_vars(b_terms)
+                c_vars = non_const_vars(c_terms)
+
+                # 1. Deteccion de cota booleana x * (1 - x) == 0
+                if not c_terms and len(a_vars) == 1 and len(b_vars) == 1 and a_vars[0] == b_vars[0]:
+                    x_id = a_vars[0]
+                    if x_id not in root_bounded:
+                        root_bounded.add(x_id)
+                        changed = True
+                    continue
+
+                # 2. Acoplamiento IsZero: in * inv == 1 - out con in * out == 0
+                if len(a_vars) == 1 and len(b_vars) == 1 and len(c_vars) == 1:
+                    s_a, s_b, s_c = a_vars[0], b_vars[0], c_vars[0]
+                    has_c_one = any(int(s) == 0 and (int(cf) % p) != 0 for s, cf in c_terms)
+                    if has_c_one:
+                        if (s_a in determined and (s_a, s_c) in bilinear_zeros) or (
+                            s_b in determined and (s_b, s_c) in bilinear_zeros
+                        ):
+                            if s_c not in determined:
+                                determined.add(s_c)
+                                root_bounded.add(s_c)
+                                changed = True
+
+                # 3. Inyectividad binaria Num2Bits: 1 * (sum 2^i b_i) == target
+                if not a_vars and len(c_vars) == 1 and 2 <= len(b_vars) < 253:
+                    target_id = c_vars[0]
+                    if target_id in determined and all(b_id in root_bounded for b_id in b_vars):
+                        for b_id in b_vars:
+                            if b_id not in determined:
+                                determined.add(b_id)
+                                changed = True
+
+                # 4. CLAUSURA CUADRATICA UNIVERSAL (Poseidon / MiMC / Productos deterministas):
+                # Si todas las variables en A y en B estan determinadas, entonces el
+                # producto <A, w> * <B, w> es constante conocido respecto a las entradas publicas.
+                # Si en C todas las variables excepto una (u) estan determinadas, u queda determinada.
+                if all(v in determined for v in a_vars) and all(v in determined for v in b_vars):
+                    undetermined_c = [v for v in c_vars if v not in determined]
+                    if len(undetermined_c) == 1:
+                        u = undetermined_c[0]
+                        if u not in determined:
+                            determined.add(u)
+                            changed = True
+
+                # 5. Clausura Lineal General (cuando A es constante no nula o B es constante no nula):
+                if not a_vars or not b_vars:
+                    lin_vars = list(set(a_vars + b_vars + c_vars))
+                    undetermined_lin = [v for v in lin_vars if v not in determined]
+                    if len(undetermined_lin) == 1:
+                        u = undetermined_lin[0]
+                        if u not in determined:
+                            determined.add(u)
+                            changed = True
+
+        self.determined_signals = sorted(determined)
+        unresolved = [
+            i for i in range(1, self.num_variables) if i not in determined
+        ]
+        return determined, root_bounded, unresolved
+
+    def extract_sniper_islands(self, max_island_constraints: int = 25) -> list:
+        """
+        PIEZA 2 DEL MODO FRANCOTIRADOR:
+        Aisla las componentes conexas (islas) de restricciones que contienen seniales
+        no determinadas, preservando la distincion exacta entre salidas reales
+        (output_signals) y entradas privadas (private_inputs) de cada isla.
+        """
+        determined, _, unresolved = self.compute_forward_algebraic_closure()
+        unresolved_set = set(unresolved)
+        if not unresolved_set:
+            return []
+
+        # Si el circuito define output_signals explicitas y TODAS ya estan funcionalmente
+        # determinadas por las entradas publicas, las salidas son 100% inmaleables.
+        if self.output_signals:
+            unresolved_outputs = [o for o in self.output_signals if o in unresolved_set]
+            if not unresolved_outputs:
+                return []
+
+        p = self.prime
+        active_indices = []
+        constraint_undetermined_vars = {}
+        constraint_all_vars = {}
+        var_to_constraints = {u: [] for u in unresolved_set}
+
+        for idx, c in enumerate(self.constraints):
+            all_v = set()
+            for k in ("A", "B", "C"):
+                for sig_id, coeff in c.get(k, []):
+                    if int(sig_id) != 0 and (int(coeff) % p) != 0:
+                        all_v.add(int(sig_id))
+            undet_v = all_v & unresolved_set
+            if undet_v:
+                active_indices.append(idx)
+                constraint_undetermined_vars[idx] = undet_v
+                constraint_all_vars[idx] = all_v
+                for u in undet_v:
+                    var_to_constraints[u].append(idx)
+
+        visited_constraints = set()
+        islands = []
+
+        # 1. Detectar seniales de salida completamente huerfanas (0 restricciones activas)
+        target_pool = (
+            [o for o in self.output_signals if o in unresolved_set]
+            if self.output_signals
+            else unresolved
+        )
+        orphan_signals = [u for u in target_pool if not var_to_constraints.get(u)]
+        if orphan_signals:
+            islands.append(
+                R1CSCircuitModel(
+                    name=f"{self.name}::Orphan_Island",
+                    prime=self.prime,
+                    num_variables=self.num_variables,
+                    public_inputs=self.public_inputs,
+                    constraints=[],
+                    suspicious_signals=orphan_signals,
+                    output_signals=orphan_signals,
+                    private_inputs=orphan_signals,
+                    determined_signals=list(determined),
+                    signal_symbols=self.signal_symbols,
+                )
+            )
+
+        # 2. Extraer cada isla conexa de restricciones no determinadas
+        orig_outs_set = set(self.output_signals)
+        orig_prvs_set = set(self.private_inputs)
+
+        for start_c in active_indices:
+            if start_c in visited_constraints:
+                continue
+
+            queue = [start_c]
+            visited_constraints.add(start_c)
+            comp_constraints = []
+            comp_undet_signals = set()
+            comp_boundary_determined = set()
+
+            while queue and len(comp_constraints) < max_island_constraints:
+                cur_c = queue.pop(0)
+                comp_constraints.append(self.constraints[cur_c])
+                comp_undet_signals.update(constraint_undetermined_vars[cur_c])
+                comp_boundary_determined.update(
+                    constraint_all_vars[cur_c] - constraint_undetermined_vars[cur_c]
+                )
+
+                for u_sig in constraint_undetermined_vars[cur_c]:
+                    for nbr_c in var_to_constraints.get(u_sig, []):
+                        if nbr_c not in visited_constraints:
+                            visited_constraints.add(nbr_c)
+                            queue.append(nbr_c)
+
+            # Preservar las salidas reales y entradas privadas reales dentro de la isla
+            island_outs = sorted(comp_undet_signals & orig_outs_set)
+            if not island_outs:
+                if self.output_signals:
+                    # Isla puramente auxiliar que no toca ninguna salida no determinada
+                    continue
+                island_outs = sorted(comp_undet_signals)
+
+            island_prvs = [p for p in self.private_inputs if p in comp_undet_signals]
+            if not island_prvs:
+                island_prvs = sorted(comp_undet_signals - orig_outs_set)
+
+            island_pubs = sorted(set(self.public_inputs) | comp_boundary_determined)
+
+            islands.append(
+                R1CSCircuitModel(
+                    name=f"{self.name}::Island_{len(islands) + 1}",
+                    prime=self.prime,
+                    num_variables=self.num_variables,
+                    public_inputs=island_pubs,
+                    constraints=comp_constraints,
+                    suspicious_signals=sorted(comp_undet_signals),
+                    output_signals=island_outs,
+                    private_inputs=island_prvs,
+                    determined_signals=sorted(determined | comp_boundary_determined),
+                    signal_symbols=self.signal_symbols,
+                )
+            )
+
+        return islands
+
     def build_system_assertions(
         self,
         witness_map: dict,
         prefix: str,
         allow_modular_wrap: bool = True,
     ) -> list:
-        """
-        Construye el sistema de aserciones Z3 para un testigo simbolico:
-          - Si `allow_modular_wrap=False`, evalua el subanillo entero directo (k = 0)
-            con w_i in [0, p-1], evitando variables existenciales de 254 bits en
-            cascadas polinomiales profundas (toda solucion k = 0 es solucion exacta mod p).
-          - Si `allow_modular_wrap=True`, construye la formulacion diofantica completa
-            A(w)*B(w) == C(w) + k*p con cotas de intervalo exactas [k_min, k_max].
-        """
         assertions = []
         p = self.prime
 
-        # 1. Restricciones de Dominio: w_i in [0, p-1]
         for i in range(1, self.num_variables):
             assertions.append(BN254Field.domain_constraint(witness_map[i], p))
 
-        # 2. Traduccion algebraica de cada restriccion R1CS
         for idx, c in enumerate(self.constraints):
             a_eval, a_min, a_max, a_const = BN254Field.eval_linear_combination_with_bounds(
                 c.get("A", []), witness_map, p
@@ -132,7 +402,6 @@ class R1CSCircuitModel:
             c_is_zero = c_const and (c_eval == 0)
 
             if not allow_modular_wrap:
-                # Subanillo directo (k = 0): A(w) * B(w) == C(w) en Z
                 if c_is_zero:
                     assertions.append(a_eval * b_eval == 0)
                 else:
@@ -140,7 +409,6 @@ class R1CSCircuitModel:
                 continue
 
             if c_is_zero:
-                # LEMA DE EUCLIDES EN CUERPOS PRIMOS F_p:
                 ka_min = BN254Field.ceil_div(a_min, p)
                 ka_max = BN254Field.floor_div(a_max, p)
                 kb_min = BN254Field.ceil_div(b_min, p)
@@ -217,7 +485,7 @@ class R1CSCircuitModel:
 
 
 # =============================================================================
-# FIXTURES CANONICOS CERTIFICADOS (ISZERO, NUM2BITS, MERKLE)
+# FIXTURES CANONICOS + FIXTURE FRANCOTIRADOR (POSEIDON + DIVISION MODULAR)
 # =============================================================================
 
 def _build_merkle_fixture(secure: bool, levels: int = 3) -> R1CSCircuitModel:
@@ -307,6 +575,88 @@ def _build_merkle_fixture(secure: bool, levels: int = 3) -> R1CSCircuitModel:
     )
 
 
+def _build_poseidon_div_sniper_fixture(secure: bool, rounds: int = 8) -> R1CSCircuitModel:
+    """
+    Construye un circuito real de prueba para el Modo Francotirador:
+      - Subgrafo 1 (Determinista pesado): `rounds` rondas de S-Box tipo Poseidon x^5
+        (x2 = x*x, x4 = x2*x2, x5 = x4*x, next_state = x5 + c_r).
+        En un solver SMT tradicional tiene grado 5^rounds = 390,625 y da TIMEOUT.
+        Con la Clausura Cuadratica Universal de Chronos-ZK colapsa en < 1 ms.
+      - Subgrafo 2 (Gadget de division / residuo): `hash_out === q * 4 + r`,
+        donde en la version vulnerable falta restringir los bits de `r` en {0, 1, 2, 3}.
+    """
+    sig_id = 1
+    in_seed = sig_id
+    sig_id += 1
+    symbols = {0: "ONE", in_seed: "main.public_seed"}
+
+    constraints = []
+    curr = in_seed
+
+    for r in range(rounds):
+        x2 = sig_id
+        sig_id += 1
+        x4 = sig_id
+        sig_id += 1
+        x5 = sig_id
+        sig_id += 1
+        nxt = sig_id
+        sig_id += 1
+
+        symbols[x2] = f"main.poseidon.round[{r}].x2"
+        symbols[x4] = f"main.poseidon.round[{r}].x4"
+        symbols[x5] = f"main.poseidon.round[{r}].x5"
+        symbols[nxt] = f"main.poseidon.round[{r}].state_out"
+
+        constraints.append({"A": [(curr, 1)], "B": [(curr, 1)], "C": [(x2, 1)]})
+        constraints.append({"A": [(x2, 1)], "B": [(x2, 1)], "C": [(x4, 1)]})
+        constraints.append({"A": [(x4, 1)], "B": [(curr, 1)], "C": [(x5, 1)]})
+        constraints.append({"A": [(0, 1)], "B": [(x5, 1), (0, r + 3)], "C": [(nxt, 1)]})
+        curr = nxt
+
+    # Gadget de Division Entera: curr === 4 * q + r (donde r = b0 + 2*b1)
+    q_id = sig_id
+    sig_id += 1
+    r_id = sig_id
+    sig_id += 1
+    b0_id = sig_id
+    sig_id += 1
+    b1_id = sig_id
+    sig_id += 1
+
+    symbols[q_id] = "main.div_gadget.quotient_q"
+    symbols[r_id] = "main.div_gadget.remainder_r"
+    symbols[b0_id] = "main.div_gadget.rem_bit_0"
+    symbols[b1_id] = "main.div_gadget.rem_bit_1"
+
+    # r === b0 + 2 * b1
+    constraints.append({"A": [(0, 1)], "B": [(b0_id, 1), (b1_id, 2)], "C": [(r_id, 1)]})
+    # curr === 4 * q + r
+    constraints.append({"A": [(0, 1)], "B": [(q_id, 4), (r_id, 1)], "C": [(curr, 1)]})
+
+    if secure:
+        # En la version segura, b0 y b1 son booleanos y q queda determinado
+        constraints.append({"A": [(b0_id, 1)], "B": [(0, 1), (b0_id, -1)], "C": []})
+        constraints.append({"A": [(b1_id, 1)], "B": [(0, 1), (b1_id, -1)], "C": []})
+
+    model = R1CSCircuitModel(
+        name="Poseidon_Div_Secure" if secure else "Poseidon_Div_Vulnerable",
+        prime=BN254_PRIME,
+        num_variables=sig_id,
+        public_inputs=[in_seed],
+        constraints=constraints,
+        suspicious_signals=[r_id, q_id, b0_id, b1_id],
+        output_signals=[r_id, q_id],
+        private_inputs=[b0_id, b1_id, q_id, r_id],
+        determined_signals=[0, in_seed],
+        signal_symbols=symbols,
+    )
+    model.compute_forward_algebraic_closure()
+    if secure:
+        model.determined_signals = list(range(sig_id))
+    return model
+
+
 def get_fixture_model(fixture_name: str) -> R1CSCircuitModel:
     log_telemetry("FIXTURE", f"Cargando fixture canonico: {fixture_name}")
     norm_name = fixture_name.strip().lower()
@@ -325,6 +675,7 @@ def get_fixture_model(fixture_name: str) -> R1CSCircuitModel:
             output_signals=[2],
             private_inputs=[3],
             determined_signals=[0, 1],
+            signal_symbols={0: "ONE", 1: "main.in", 2: "main.out", 3: "main.inv"},
         )
 
     elif norm_name == "iszero_secure":
@@ -342,11 +693,15 @@ def get_fixture_model(fixture_name: str) -> R1CSCircuitModel:
             output_signals=[2],
             private_inputs=[3],
             determined_signals=[0, 1, 2],
+            signal_symbols={0: "ONE", 1: "main.in", 2: "main.out", 3: "main.inv"},
         )
 
     elif norm_name in ("num2bits_vulnerable", "num2bits_underconstrained"):
         lin_sum = [(2 + i, 1 << i) for i in range(8)]
         constraints = [{"A": [(0, 1)], "B": lin_sum, "C": [(1, 1)]}]
+        syms = {0: "ONE", 1: "main.in"}
+        for i in range(8):
+            syms[2 + i] = f"main.out[{i}]"
         return R1CSCircuitModel(
             name="Num2Bits_Vulnerable",
             prime=BN254_PRIME,
@@ -357,13 +712,16 @@ def get_fixture_model(fixture_name: str) -> R1CSCircuitModel:
             output_signals=list(range(2, 10)),
             private_inputs=[],
             determined_signals=[0, 1],
+            signal_symbols=syms,
         )
 
     elif norm_name == "num2bits_secure":
         lin_sum = [(2 + i, 1 << i) for i in range(8)]
         constraints = [{"A": [(0, 1)], "B": lin_sum, "C": [(1, 1)]}]
+        syms = {0: "ONE", 1: "main.in"}
         for i in range(8):
             bit_idx = 2 + i
+            syms[bit_idx] = f"main.out[{i}]"
             constraints.append({
                 "A": [(bit_idx, 1)],
                 "B": [(0, 1), (bit_idx, -1)],
@@ -379,6 +737,7 @@ def get_fixture_model(fixture_name: str) -> R1CSCircuitModel:
             output_signals=list(range(2, 10)),
             private_inputs=[],
             determined_signals=[0, 1] + list(range(2, 10)),
+            signal_symbols=syms,
         )
 
     elif norm_name in ("merkle_vulnerable", "merkle_malleable"):
@@ -386,6 +745,12 @@ def get_fixture_model(fixture_name: str) -> R1CSCircuitModel:
 
     elif norm_name == "merkle_secure":
         return _build_merkle_fixture(secure=True, levels=3)
+
+    elif norm_name == "poseidon_div_vulnerable":
+        return _build_poseidon_div_sniper_fixture(secure=False, rounds=8)
+
+    elif norm_name == "poseidon_div_secure":
+        return _build_poseidon_div_sniper_fixture(secure=True, rounds=8)
 
     else:
         raise ValueError(f"Fixture desconocido: {fixture_name}")

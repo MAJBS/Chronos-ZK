@@ -1,14 +1,15 @@
 //! ===========================================================================
 //! CHRONOS-ZK: SLICER TOPOLOGICO Y EXPORTADOR DE CONTRATO CHRONOS-IR
 //! Modulo: core_pruner/src/constraint_slicer.rs
-//! Proposito: Poda de subgrafos deterministas cerrados (conservando el cono
-//!            residual de verificacion SMT) y exportacion de pruned_ir.json.
+//! Proposito: Poda de subgrafos deterministas cerrados (incluyendo esponjas
+//!            Poseidon / MiMC), exportacion de simbolos .sym y patrones de
+//!            vulnerabilidad para el Modo Francotirador (--sniper).
 //! ===========================================================================
 
 use crate::l4_propagator::L4State;
 use crate::r1cs_parser::{R1CSCircuit, SparseConstraint};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 
@@ -22,6 +23,8 @@ pub struct PrunedIRJson {
     pub output_signals: Vec<usize>,
     pub determined_signals: Vec<usize>,
     pub suspicious_signals: Vec<usize>,
+    pub signal_symbols: BTreeMap<String, String>,
+    pub sniper_patterns: BTreeMap<String, String>,
     pub r1cs_constraints: Vec<PrunedConstraintJson>,
 }
 
@@ -48,22 +51,31 @@ pub fn slice_and_export_ir(
     l4_state: &L4State,
     output_path: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    // 1. Construir conjunto de seniales protegidas (salidas + candidatos a maleabilidad)
-    //    cuyas restricciones definitorias conforman el nucleo residual para Z3.
-    let mut cone_signals: HashSet<usize> = HashSet::new();
-    for &out_id in &circuit.output_signals {
-        cone_signals.insert(out_id);
-    }
+    // 1. Aislar el cono de incertidumbre: todas las seniales NO determinadas
+    //    y las seniales de salida que aun no estan determinadas.
+    let mut uncertain_cone: HashSet<usize> = HashSet::new();
     for &mal_id in &l4_state.malleable_candidates {
-        cone_signals.insert(mal_id);
+        uncertain_cone.insert(mal_id);
+    }
+    for &out_id in &circuit.output_signals {
+        if !l4_state.determined_signals.contains(&out_id) {
+            uncertain_cone.insert(out_id);
+        }
     }
 
-    // Expandir 1 salto hacia atras sobre restricciones no-lineales acopladas a las salidas
-    // para garantizar que Z3 disponga de las ecuaciones completas sobre output_signals.
-    let mut expanded_cone = cone_signals.clone();
+    // Si todo el circuito esta determinado (circuito seguro), preservar solo la frontera
+    // directa de las salidas para que Z3 certifique formalmente UNSAT.
+    if uncertain_cone.is_empty() {
+        for &out_id in &circuit.output_signals {
+            uncertain_cone.insert(out_id);
+        }
+    }
+
+    // Expandir 1 salto alrededor del cono de incertidumbre
+    let mut expanded_cone = uncertain_cone.clone();
     for c in &circuit.constraints {
         let sigs = extract_constraint_signals(c);
-        if sigs.iter().any(|s| cone_signals.contains(s)) {
+        if sigs.iter().any(|s| uncertain_cone.contains(s)) {
             for s in sigs {
                 expanded_cone.insert(s);
             }
@@ -75,7 +87,6 @@ pub fn slice_and_export_ir(
     for c in &circuit.constraints {
         let sigs = extract_constraint_signals(c);
         if sigs.is_empty() {
-            // Poda de restriccion tautologica vacia 0 === 0
             continue;
         }
 
@@ -84,8 +95,8 @@ pub fn slice_and_export_ir(
             .all(|s| l4_state.determined_signals.contains(s));
         let touches_cone = sigs.iter().any(|s| expanded_cone.contains(s));
 
-        // Si todas las seniales de la restriccion pertenecen a un subgrafo determinista
-        // ya resuelto en L4 y estan desacopladas del cono de evaluacion, se poda la restriccion.
+        // Podar toda restriccion cuyas variables esten 100% determinadas (ej. rondas
+        // de Poseidon aguas arriba) y que no toque el cono de incertidumbre.
         if all_determined && !touches_cone {
             continue;
         }
@@ -124,6 +135,16 @@ pub fn slice_and_export_ir(
         circuit.output_signals.clone()
     };
 
+    let mut signal_symbols = BTreeMap::new();
+    for (&w_id, sym_name) in &circuit.wire_to_symbol {
+        signal_symbols.insert(w_id.to_string(), sym_name.clone());
+    }
+
+    let mut sniper_patterns = BTreeMap::new();
+    for (&w_id, pat) in &l4_state.vulnerability_patterns {
+        sniper_patterns.insert(w_id.to_string(), pat.clone());
+    }
+
     let ir = PrunedIRJson {
         name: circuit.name.clone(),
         field_prime: circuit.field_prime.clone(),
@@ -133,6 +154,8 @@ pub fn slice_and_export_ir(
         output_signals: circuit.output_signals.clone(),
         determined_signals: determined_sorted,
         suspicious_signals: suspicious,
+        signal_symbols,
+        sniper_patterns,
         r1cs_constraints: surviving_constraints,
     };
 

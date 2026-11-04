@@ -7,19 +7,32 @@ echo ===========================================================================
 
 if "%~1"=="" (
     echo [ERROR] No se especifico el archivo de circuito.
-    echo Uso: .\audit_circuit.bat ^<circuito.circom^|r1cs.json^> [--gpu ^| --cpu]
+    echo Uso: .\audit_circuit.bat ^<circuito.circom^|r1cs^|json^> [--gpu ^| --cpu] [--sniper]
     exit /b 1
 )
 
 set TARGET_CIRCUIT=%~1
 set MODE=--cpu
-if /I "%~2"=="--gpu" set MODE=--gpu
-if /I "%~2"=="--cpu" set MODE=--cpu
+set SNIPER_FLAG=--sniper
+
+for %%A in (%*) do (
+    if /I "%%~A"=="--gpu" set MODE=--gpu
+    if /I "%%~A"=="--cpu" set MODE=--cpu
+    if /I "%%~A"=="--no-sniper" set SNIPER_FLAG=
+)
+
+REM Autodetectar archivo de simbolos .sym si existe junto al circuito
+set SYM_CANDIDATE=%~dpn1.sym
+set SYM_ARGS_RUST=
+set SYM_ARGS_PY=
+if exist "!SYM_CANDIDATE!" (
+    set SYM_ARGS_RUST=--sym "!SYM_CANDIDATE!"
+    set SYM_ARGS_PY=--sym "!SYM_CANDIDATE!"
+)
 
 echo [*] Target: %TARGET_CIRCUIT%
-echo [*] Modo de aceleracion: %MODE%
+echo [*] Modo de aceleracion: %MODE% %SNIPER_FLAG%
 
-REM 1. Verificar y compilar el podador de Rust si no existe
 if not exist "core_pruner\target\release\core_pruner.exe" (
     echo [*] Binario de Rust no detectado. Compilando core_pruner en release...
     cd core_pruner
@@ -32,7 +45,6 @@ if not exist "core_pruner\target\release\core_pruner.exe" (
     cd ..
 )
 
-REM 2. Si el modo es GPU, verificar binario CUDA
 if "%MODE%"=="--gpu" (
     if not exist "cuda_pruner\zk_megakernel.exe" (
         echo [*] Binario CUDA no detectado. Compilando zk_megakernel con NVCC sm_86...
@@ -47,19 +59,17 @@ if "%MODE%"=="--gpu" (
     )
 )
 
-REM 3. Ejecutar la Poda Coinductiva L4 (Genera pruned_ir.json pasando %MODE%)
 echo.
 echo [*] FASE 1: Podando grafo de restricciones con Chronos-ZK (%MODE%)...
-.\core_pruner\target\release\core_pruner.exe --input "%TARGET_CIRCUIT%" --output pruned_ir.json %MODE%
+.\core_pruner\target\release\core_pruner.exe --input "%TARGET_CIRCUIT%" --output pruned_ir.json %MODE% !SYM_ARGS_RUST!
 if %ERRORLEVEL% NEQ 0 (
     echo [FATAL] Error en la poda coinductiva del circuito.
     exit /b 1
 )
 
-REM 4. Ejecutar el Oraculo SMT en Z3
 echo.
 echo [*] FASE 2: Verificando unicidad de testigo formal en Z3 SMT Solver...
-python -m smt_verifier.witness_uniqueness --ir pruned_ir.json
+python -m smt_verifier.witness_uniqueness --ir pruned_ir.json !SYM_ARGS_PY! %SNIPER_FLAG%
 
 if %ERRORLEVEL% EQU 0 (
     echo.

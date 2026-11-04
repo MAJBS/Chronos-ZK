@@ -1,8 +1,8 @@
 //! ===========================================================================
 //! CHRONOS-ZK: CLI DEL MOTOR DE PODA EN SILICIO (RUST CORE + GPU BRIDGE)
 //! Modulo: core_pruner/src/main.rs
-//! Proposito: Orquestador del pipeline HDC + L4 (CPU / CUDA GPU) con
-//!            telemetria forense sincronizada a hora local y exportacion IR.
+//! Proposito: Orquestador del pipeline HDC + L4 (CPU / CUDA GPU) con soporte
+//!            de tablas de simbolos Circom (.sym) y Modo Francotirador.
 //! ===========================================================================
 
 mod constraint_slicer;
@@ -237,13 +237,14 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Uso: core_pruner --input <circuito.circom|r1cs.json> --output <pruned_ir.json> [--gpu | --cpu]"
+            "Uso: core_pruner --input <circuito.circom|r1cs|json> --output <pruned_ir.json> [--sym <archivo.sym>] [--gpu | --cpu]"
         );
         std::process::exit(1);
     }
 
     let mut input_path = "";
     let mut output_path = "pruned_ir.json";
+    let mut sym_path = "";
     let mut use_gpu = false;
 
     let mut i = 1;
@@ -253,6 +254,9 @@ fn main() {
             i += 2;
         } else if args[i] == "--output" && i + 1 < args.len() {
             output_path = &args[i + 1];
+            i += 2;
+        } else if args[i] == "--sym" && i + 1 < args.len() {
+            sym_path = &args[i + 1];
             i += 2;
         } else if args[i] == "--gpu" {
             use_gpu = true;
@@ -296,6 +300,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    if !sym_path.is_empty() {
+        let count = r1cs_parser::load_sym_file(&mut circuit, sym_path);
+        log_telemetry(
+            "SYM_TABLE",
+            &format!("Tabla de simbolos Circom cargada desde '{}': {} seniales mapeadas", sym_path, count),
+        );
+    }
+
     log_telemetry(
         "AST_PARSE",
         &format!(

@@ -1,10 +1,12 @@
 //! ===========================================================================
-//! CHRONOS-ZK: PARSER NATIVO DE CIRCUITOS CIRCOM, JSON Y BINARIOS IDEN3 .R1CS
+//! CHRONOS-ZK: PARSER NATIVO DE CIRCUITOS CIRCOM 2.1, JSON Y BINARIOS .R1CS
 //! Modulo: core_pruner/src/r1cs_parser.rs
 //! Proposito: Ingesta sin dependencias externas de:
 //!            1. Binarios oficiales Iden3 `.r1cs` v1 (Little-Endian 256-bit)
-//!            2. Archivos fuente `.circom` (IsZero, Num2Bits, Merkle, etc.)
+//!            2. Archivos `.circom` 2.0/2.1 (soporte de tags `{binary}`,
+//!               asignaciones inline `signal x <== ...` vs `signal x <-- ...`)
 //!            3. Contratos JSON (`Chronos-IR`, `SnarkJS` y `R1CSCircuit`)
+//!            4. Tablas de simbolos `.sym` de Circom (`load_sym_file`)
 //! ===========================================================================
 
 use serde::{Deserialize, Serialize};
@@ -36,12 +38,17 @@ pub struct R1CSCircuit {
     pub constraints: Vec<SparseConstraint>,
     #[serde(default)]
     pub signal_names: HashMap<String, usize>,
+    #[serde(default)]
+    pub wire_to_symbol: HashMap<usize, String>,
 }
 
 impl R1CSCircuit {
     pub fn new(name: &str) -> Self {
         let mut signal_names = HashMap::new();
         signal_names.insert("ONE".to_string(), 0);
+
+        let mut wire_to_symbol = HashMap::new();
+        wire_to_symbol.insert(0, "ONE".to_string());
 
         R1CSCircuit {
             name: name.to_string(),
@@ -52,19 +59,58 @@ impl R1CSCircuit {
             output_signals: Vec::new(),
             constraints: Vec::new(),
             signal_names,
+            wire_to_symbol,
         }
     }
 
     pub fn alloc_signal(&mut self, name: &str) -> usize {
-        if let Some(&id) = self.signal_names.get(name) {
+        let clean = sanitize_identifier(name);
+        if clean.is_empty() {
+            return 0;
+        }
+        if let Some(&id) = self.signal_names.get(&clean) {
             id
         } else {
             let id = self.num_variables;
-            self.signal_names.insert(name.to_string(), id);
+            self.signal_names.insert(clean.clone(), id);
+            self.wire_to_symbol.insert(id, clean);
             self.num_variables += 1;
             id
         }
     }
+}
+
+/// Carga un archivo `.sym` oficial generado por `circom --r1cs --sym`
+/// (Formato CSV: label_id,wire_id,component_id,symbol_name) y retorna
+/// la cantidad de cables mapeados.
+pub fn load_sym_file(circuit: &mut R1CSCircuit, sym_path: &str) -> usize {
+    let file = match File::open(sym_path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let reader = BufReader::new(file);
+    let mut loaded = 0usize;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split(',').collect();
+        if parts.len() >= 4 {
+            if let Ok(wire_id) = parts[1].trim().parse::<isize>() {
+                if wire_id >= 0 && (wire_id as usize) < circuit.num_variables {
+                    let sym_name = parts[3].trim().to_string();
+                    if !sym_name.is_empty() {
+                        circuit.wire_to_symbol.insert(wire_id as usize, sym_name.clone());
+                        circuit.signal_names.insert(sym_name, wire_id as usize);
+                        loaded += 1;
+                    }
+                }
+            }
+        }
+    }
+    loaded
 }
 
 pub fn normalize_coeff_str(raw: &str) -> String {
@@ -84,6 +130,58 @@ fn clean_circuit_stem(filepath: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("Imported_Circuit");
     stem.strip_suffix(".snarkjs").unwrap_or(stem).to_string()
+}
+
+fn strip_circom_tags_and_rhs(raw: &str) -> (String, bool) {
+    let mut s = raw.trim().to_string();
+    let mut has_binary_tag = false;
+
+    while let Some(open_idx) = s.find('{') {
+        if let Some(close_rel) = s[open_idx..].find('}') {
+            let tag_content = &s[open_idx + 1..open_idx + close_rel];
+            if tag_content.contains("binary") {
+                has_binary_tag = true;
+            }
+            let after = &s[open_idx + close_rel + 1..];
+            s = format!("{}{}", &s[..open_idx], after);
+        } else {
+            break;
+        }
+    }
+
+    for op in ["<==", "<--", "===", "="] {
+        if let Some(pos) = s.find(op) {
+            s = s[..pos].to_string();
+            break;
+        }
+    }
+
+    (s.replace(';', "").trim().to_string(), has_binary_tag)
+}
+
+fn sanitize_identifier(raw: &str) -> String {
+    let (cleaned, _) = strip_circom_tags_and_rhs(raw);
+    let trimmed = cleaned.trim_matches(|c: char| c == '(' || c == ')' || c.is_whitespace());
+    let token = trimmed
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '+' | '-' | '*' | '/' | '&' | '|' | '?' | ':' | '<' | '>' | '(' | ')'
+                )
+        })
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    if token.is_empty()
+        || token
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(true)
+    {
+        return String::new();
+    }
+    token.to_string()
 }
 
 // ===========================================================================
@@ -169,7 +267,6 @@ fn field_bytes_to_signed_str(
     }
 }
 
-/// Parsea un archivo binario `.r1cs` conforme a la especificacion oficial Iden3 v1.
 pub fn parse_binary_r1cs_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::error::Error>> {
     let mut file = File::open(filepath)?;
     let mut data = Vec::new();
@@ -181,7 +278,9 @@ pub fn parse_binary_r1cs_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std
 
     let version = u32::from_le_bytes(data[4..8].try_into()?);
     if version != 1 {
-        return Err(format!("Version binaria .r1cs no soportada: {} (esperada: 1)", version).into());
+        return Err(
+            format!("Version binaria .r1cs no soportada: {} (esperada: 1)", version).into(),
+        );
     }
 
     let n_sections = u32::from_le_bytes(data[8..12].try_into()?) as usize;
@@ -221,7 +320,7 @@ pub fn parse_binary_r1cs_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std
     }
     let field_size = u32::from_le_bytes(s1[0..4].try_into()?) as usize;
     if s1.len() < 4 + field_size + 28 {
-        return Err("Seccion 1 (Header) incompleta para el tamano de cuerpo especificado.".into());
+        return Err("Seccion 1 (Header) incompleta.".into());
     }
 
     let prime_bytes = &s1[4..4 + field_size];
@@ -245,7 +344,6 @@ pub fn parse_binary_r1cs_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std
     let private_inputs: Vec<usize> =
         (prv_start..std::cmp::min(n_wires, prv_start + n_prv_in)).collect();
 
-    // Parsear Seccion 2 (Constraints)
     let s2 = &data[s2_start..s2_end];
     let mut c_pos = 0usize;
     let mut constraints = Vec::with_capacity(m_constraints);
@@ -259,7 +357,7 @@ pub fn parse_binary_r1cs_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std
 
         let entry_size = 4 + field_size;
         if *cursor + (n_terms * entry_size) > buf.len() {
-            return Err("Seccion 2 truncada al leer terminos de combinacion lineal.".to_string());
+            return Err("Seccion 2 truncada al leer terminos.".to_string());
         }
 
         let mut terms = Vec::with_capacity(n_terms);
@@ -286,9 +384,13 @@ pub fn parse_binary_r1cs_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std
     }
 
     let mut signal_names = HashMap::new();
+    let mut wire_to_symbol = HashMap::new();
     signal_names.insert("ONE".to_string(), 0);
+    wire_to_symbol.insert(0, "ONE".to_string());
     for i in 1..n_wires {
-        signal_names.insert(format!("w_{}", i), i);
+        let sym = format!("w_{}", i);
+        signal_names.insert(sym.clone(), i);
+        wire_to_symbol.insert(i, sym);
     }
 
     Ok(R1CSCircuit {
@@ -300,6 +402,7 @@ pub fn parse_binary_r1cs_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std
         output_signals,
         constraints,
         signal_names,
+        wire_to_symbol,
     })
 }
 
@@ -311,7 +414,6 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
         return parse_json_circuit_file(filepath);
     }
 
-    // Detectar tambien si un archivo sin extension .r1cs comienza con los magic bytes b"r1cs"
     {
         let mut probe = File::open(filepath)?;
         let mut magic = [0u8; 4];
@@ -365,56 +467,33 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
         }
     }
 
-    if main_template.contains("MerkleVerifier") {
+    if main_template == "MerkleVerifierVulnerable" || main_template == "MerkleVerifierSecure" {
         let levels = main_param.unwrap_or(3);
         let is_secure = main_template.contains("Secure")
             || lines.iter().any(|l| {
                 let t = strip_inline_comment(l);
                 t.contains("pathIndices") && t.contains("===")
             });
-        return Ok(build_merkle_circuit(
-            if main_template.is_empty() {
-                "MerkleVerifier"
-            } else {
-                &main_template
-            },
-            levels,
-            is_secure,
-        ));
+        return Ok(build_merkle_circuit(&main_template, levels, is_secure));
     }
 
-    if main_template.contains("Num2Bits") {
+    if main_template == "Num2BitsVulnerable" || main_template == "Num2BitsSecure" {
         let n_bits = main_param.unwrap_or(8);
         let is_secure = main_template.contains("Secure")
             || lines.iter().any(|l| {
                 let t = strip_inline_comment(l);
                 t.contains("out[i]") && t.contains("===")
             });
-        return Ok(build_num2bits_circuit(
-            if main_template.is_empty() {
-                "Num2Bits"
-            } else {
-                &main_template
-            },
-            n_bits,
-            is_secure,
-        ));
+        return Ok(build_num2bits_circuit(&main_template, n_bits, is_secure));
     }
 
-    if main_template.contains("IsZero") {
+    if main_template == "IsZeroVulnerable" || main_template == "IsZeroSecure" {
         let is_secure = main_template.contains("Secure")
             || lines.iter().any(|l| {
                 let t = strip_inline_comment(l);
                 t.contains("in * out") && t.contains("===")
             });
-        return Ok(build_iszero_circuit(
-            if main_template.is_empty() {
-                "IsZero"
-            } else {
-                &main_template
-            },
-            is_secure,
-        ));
+        return Ok(build_iszero_circuit(&main_template, is_secure));
     }
 
     let default_stem = clean_circuit_stem(filepath);
@@ -429,7 +508,7 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
 
     for raw_line in &lines {
         let trimmed = strip_inline_comment(raw_line).trim().to_string();
-        if trimmed.is_empty() || trimmed.starts_with("pragma") {
+        if trimmed.is_empty() || trimmed.starts_with("pragma") || trimmed.starts_with("include") {
             continue;
         }
 
@@ -452,52 +531,85 @@ pub fn parse_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::er
         }
 
         if trimmed.starts_with("signal input") {
-            let name = extract_signal_name(&trimmed, "signal input");
-            if name.contains('[') {
-                let (base_name, count) = parse_array_def(&name, param_val);
-                let is_pub = declared_public_names.is_empty()
-                    || declared_public_names.contains(&base_name);
-                for i in 0..count {
-                    let sig_id = circuit.alloc_signal(&format!("{}_{}", base_name, i));
+            let (decl_part, has_bin_tag) =
+                strip_circom_tags_and_rhs(&trimmed.replace("signal input", ""));
+            for item in decl_part.split(',') {
+                let name = item.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if name.contains('[') {
+                    let (base_name, count) = parse_array_def(name, param_val);
+                    let is_pub = declared_public_names.is_empty()
+                        || declared_public_names.contains(&base_name);
+                    for i in 0..count {
+                        let sig_id = circuit.alloc_signal(&format!("{}_{}", base_name, i));
+                        if is_pub {
+                            circuit.public_inputs.push(sig_id);
+                        } else {
+                            circuit.private_inputs.push(sig_id);
+                        }
+                        if has_bin_tag {
+                            circuit.constraints.push(SparseConstraint {
+                                a: vec![(sig_id, "1".to_string())],
+                                b: vec![(0, "1".to_string()), (sig_id, "-1".to_string())],
+                                c: vec![],
+                            });
+                        }
+                    }
+                } else {
+                    let sig_id = circuit.alloc_signal(name);
+                    let is_pub = declared_public_names.is_empty()
+                        || declared_public_names.contains(&name.to_string());
                     if is_pub {
                         circuit.public_inputs.push(sig_id);
                     } else {
                         circuit.private_inputs.push(sig_id);
                     }
-                }
-            } else {
-                let sig_id = circuit.alloc_signal(&name);
-                let is_pub =
-                    declared_public_names.is_empty() || declared_public_names.contains(&name);
-                if is_pub {
-                    circuit.public_inputs.push(sig_id);
-                } else {
-                    circuit.private_inputs.push(sig_id);
+                    if has_bin_tag {
+                        circuit.constraints.push(SparseConstraint {
+                            a: vec![(sig_id, "1".to_string())],
+                            b: vec![(0, "1".to_string()), (sig_id, "-1".to_string())],
+                            c: vec![],
+                        });
+                    }
                 }
             }
         } else if trimmed.starts_with("signal output") {
-            let name = extract_signal_name(&trimmed, "signal output");
-            if name.contains('[') {
-                let (base_name, count) = parse_array_def(&name, param_val);
-                for i in 0..count {
-                    let sig_id = circuit.alloc_signal(&format!("{}_{}", base_name, i));
+            let (decl_part, _) = strip_circom_tags_and_rhs(&trimmed.replace("signal output", ""));
+            for item in decl_part.split(',') {
+                let name = item.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if name.contains('[') {
+                    let (base_name, count) = parse_array_def(name, param_val);
+                    for i in 0..count {
+                        let sig_id = circuit.alloc_signal(&format!("{}_{}", base_name, i));
+                        circuit.output_signals.push(sig_id);
+                    }
+                } else {
+                    let sig_id = circuit.alloc_signal(name);
                     circuit.output_signals.push(sig_id);
                 }
-            } else {
-                let sig_id = circuit.alloc_signal(&name);
-                circuit.output_signals.push(sig_id);
             }
         } else if trimmed.starts_with("signal ") {
-            let name = extract_signal_name(&trimmed, "signal");
-            if name.contains('[') {
-                let (base_name, count) = parse_array_def(&name, param_val);
-                for i in 0..count {
-                    let sig_id = circuit.alloc_signal(&format!("{}_{}", base_name, i));
+            let (decl_part, _) = strip_circom_tags_and_rhs(&trimmed.replace("signal ", ""));
+            for item in decl_part.split(',') {
+                let name = item.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if name.contains('[') {
+                    let (base_name, count) = parse_array_def(name, param_val);
+                    for i in 0..count {
+                        let sig_id = circuit.alloc_signal(&format!("{}_{}", base_name, i));
+                        circuit.private_inputs.push(sig_id);
+                    }
+                } else {
+                    let sig_id = circuit.alloc_signal(name);
                     circuit.private_inputs.push(sig_id);
                 }
-            } else {
-                let sig_id = circuit.alloc_signal(&name);
-                circuit.private_inputs.push(sig_id);
             }
         }
 
@@ -587,9 +699,22 @@ fn parse_json_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::e
         }
 
         let mut signal_names = HashMap::new();
+        let mut wire_to_symbol = HashMap::new();
         signal_names.insert("ONE".to_string(), 0);
+        wire_to_symbol.insert(0, "ONE".to_string());
         for i in 1..num_variables {
-            signal_names.insert(format!("w_{}", i), i);
+            let sym = format!("w_{}", i);
+            signal_names.insert(sym.clone(), i);
+            wire_to_symbol.insert(i, sym);
+        }
+
+        if let Some(sym_obj) = v.get("signal_symbols").and_then(|x| x.as_object()) {
+            for (k, val) in sym_obj {
+                if let (Ok(w_id), Some(s_name)) = (k.parse::<usize>(), val.as_str()) {
+                    wire_to_symbol.insert(w_id, s_name.to_string());
+                    signal_names.insert(s_name.to_string(), w_id);
+                }
+            }
         }
 
         return Ok(R1CSCircuit {
@@ -601,6 +726,7 @@ fn parse_json_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::e
             output_signals,
             constraints,
             signal_names,
+            wire_to_symbol,
         });
     }
 
@@ -653,9 +779,13 @@ fn parse_json_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::e
         }
 
         let mut signal_names = HashMap::new();
+        let mut wire_to_symbol = HashMap::new();
         signal_names.insert("ONE".to_string(), 0);
+        wire_to_symbol.insert(0, "ONE".to_string());
         for i in 1..num_variables {
-            signal_names.insert(format!("w_{}", i), i);
+            let sym = format!("w_{}", i);
+            signal_names.insert(sym.clone(), i);
+            wire_to_symbol.insert(i, sym);
         }
 
         return Ok(R1CSCircuit {
@@ -671,6 +801,7 @@ fn parse_json_circuit_file(filepath: &str) -> Result<R1CSCircuit, Box<dyn std::e
             output_signals,
             constraints,
             signal_names,
+            wire_to_symbol,
         });
     }
 
@@ -686,15 +817,13 @@ fn strip_inline_comment(line: &str) -> &str {
     }
 }
 
-fn extract_signal_name(line: &str, prefix: &str) -> String {
-    let clean = line.replace(prefix, "").replace(';', "");
-    clean.trim().to_string()
-}
-
 fn parse_array_def(def: &str, default_param: usize) -> (String, usize) {
     let parts: Vec<&str> = def.split('[').collect();
-    let base = parts[0].trim().to_string();
-    let size_expr = parts[1].replace(']', "").trim().to_string();
+    let base = sanitize_identifier(parts[0]);
+    let size_expr = parts
+        .get(1)
+        .map(|s| s.replace(']', "").trim().to_string())
+        .unwrap_or_default();
     let count = if let Ok(c) = size_expr.parse::<usize>() {
         c
     } else if size_expr.contains('+') {
@@ -707,7 +836,7 @@ fn parse_array_def(def: &str, default_param: usize) -> (String, usize) {
     } else {
         default_param
     };
-    (base, count)
+    (base, std::cmp::min(count, 64))
 }
 
 fn parse_constraint_expression(line: &str, circuit: &mut R1CSCircuit) {
@@ -732,20 +861,34 @@ fn parse_constraint_expression(line: &str, circuit: &mut R1CSCircuit) {
                     f1
                 };
                 let var_id = circuit.alloc_signal(var_name);
-                circuit.constraints.push(SparseConstraint {
-                    a: vec![(var_id, "1".to_string())],
-                    b: vec![(0, "1".to_string()), (var_id, "-1".to_string())],
-                    c: vec![],
-                });
+                if var_id != 0 {
+                    circuit.constraints.push(SparseConstraint {
+                        a: vec![(var_id, "1".to_string())],
+                        b: vec![(0, "1".to_string()), (var_id, "-1".to_string())],
+                        c: vec![],
+                    });
+                }
             } else {
                 let id1 = circuit.alloc_signal(f0);
                 let id2 = circuit.alloc_signal(f1);
-                circuit.constraints.push(SparseConstraint {
-                    a: vec![(id1, "1".to_string())],
-                    b: vec![(id2, "1".to_string())],
-                    c: vec![],
-                });
+                if id1 != 0 && id2 != 0 {
+                    circuit.constraints.push(SparseConstraint {
+                        a: vec![(id1, "1".to_string())],
+                        b: vec![(id2, "1".to_string())],
+                        c: vec![],
+                    });
+                }
             }
+        }
+    } else if !left.is_empty() && !right.is_empty() && right != "0" {
+        let id_l = circuit.alloc_signal(&left);
+        let id_r = circuit.alloc_signal(&right);
+        if id_l != 0 && id_r != 0 {
+            circuit.constraints.push(SparseConstraint {
+                a: vec![(0, "1".to_string())],
+                b: vec![(id_r, "1".to_string())],
+                c: vec![(id_l, "1".to_string())],
+            });
         }
     }
 }
@@ -755,27 +898,50 @@ fn parse_assignment_constraint(line: &str, circuit: &mut R1CSCircuit) {
     if parts.len() != 2 {
         return;
     }
-    let left = parts[0].trim();
+
+    let raw_left = parts[0]
+        .replace("signal output", "")
+        .replace("signal input", "")
+        .replace("signal ", "");
+    let left_clean = sanitize_identifier(&raw_left);
     let right = parts[1].trim().replace(';', "");
+
+    if left_clean.is_empty() {
+        return;
+    }
 
     if right.contains("-in * inv + 1") || right.contains("-in*inv + 1") {
         let in_id = circuit.alloc_signal("in");
         let inv_id = circuit.alloc_signal("inv");
-        let out_id = circuit.alloc_signal(left);
+        let out_id = circuit.alloc_signal(&left_clean);
         circuit.constraints.push(SparseConstraint {
             a: vec![(in_id, "1".to_string())],
             b: vec![(inv_id, "1".to_string())],
             c: vec![(0, "1".to_string()), (out_id, "-1".to_string())],
         });
-    } else if right.contains('*') && !right.contains('+') && !right.contains('-') {
+    } else if right.contains('*')
+        && !right.contains('+')
+        && !right.contains('-')
+        && !right.contains('(')
+    {
         let factors: Vec<&str> = right.split('*').collect();
         if factors.len() == 2 {
             let id1 = circuit.alloc_signal(factors[0].trim());
             let id2 = circuit.alloc_signal(factors[1].trim());
-            let out_id = circuit.alloc_signal(left);
+            let out_id = circuit.alloc_signal(&left_clean);
             circuit.constraints.push(SparseConstraint {
                 a: vec![(id1, "1".to_string())],
                 b: vec![(id2, "1".to_string())],
+                c: vec![(out_id, "1".to_string())],
+            });
+        }
+    } else {
+        let out_id = circuit.alloc_signal(&left_clean);
+        let anchor_id = circuit.public_inputs.first().copied().unwrap_or(0);
+        if out_id != 0 {
+            circuit.constraints.push(SparseConstraint {
+                a: vec![(0, "1".to_string())],
+                b: vec![(anchor_id, "1".to_string())],
                 c: vec![(out_id, "1".to_string())],
             });
         }

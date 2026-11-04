@@ -1,10 +1,11 @@
 """
 =============================================================================
-CHRONOS-ZK: ORACULO DE VERIFICACION FORMAL DE UNICIDAD DE TESTIGO
+CHRONOS-ZK: ORACULO DE VERIFICACION FORMAL Y MODO FRANCOTIRADOR (--SNIPER)
 Modulo: smt_verifier/witness_uniqueness.py
-Proposito: Evaluacion formal de maleabilidad criptografica con reduccion de
-           frontera determinista L4 (determined_signals), Sonda Existencial
-           1-Dispersa (Fase 1) y verificacion diofantica modular (Fase 2).
+Proposito: Evaluacion formal de maleabilidad criptografica con:
+             1. Clausura Funcional Cuadratica Universal (colapso Poseidon/MiMC)
+             2. Micro-Slicing por Isla Sospechosa (--sniper)
+             3. Resolucion de nombres simbolicos Circom (--sym <file.sym>)
 =============================================================================
 """
 
@@ -44,8 +45,6 @@ def _build_solver_instance(
             solver.add(w_A[pub_idx] == w_B[pub_idx])
             locked_signals.add(pub_idx)
 
-    # Aplicar invariantes de frontera L4 sobre toda senial certificada como
-    # funcionalmente determinada por las entradas publicas (determined_signals).
     frontier_count = 0
     for det_idx in model.determined_signals:
         if 0 < det_idx < model.num_variables and det_idx not in locked_signals:
@@ -53,10 +52,6 @@ def _build_solver_instance(
             locked_signals.add(det_idx)
             frontier_count += 1
 
-    # Sonda Existencial 1-Dispersa (Fase 1 para cascadas no-lineales):
-    # Fija las entradas publicas a escalares concretos pequenos (colapsando
-    # productos bilineales publico*privado a ecuaciones lineales) y aisla la
-    # perturbacion sobre el primer grado de libertad privado no determinado.
     if sparse_fault_probe:
         for idx_pos, pub_idx in enumerate(model.public_inputs):
             if 0 < pub_idx < model.num_variables:
@@ -74,8 +69,6 @@ def _build_solver_instance(
             solver.add(w_A[target_fault_sig] == 0)
             solver.add(z3.And(w_B[target_fault_sig] >= 0, w_B[target_fault_sig] <= 4))
             for other_prv in free_privates[1:]:
-                # Fijamos el resto de selectores libres del arbol en 0 si no son
-                # seniales intermedias calculadas (solo los primeros selectores de ruta)
                 if other_prv < target_fault_sig + 3:
                     solver.add(w_A[other_prv] == 0)
                     solver.add(w_B[other_prv] == 0)
@@ -87,6 +80,54 @@ def _build_solver_instance(
     solver.add(malleability_condition)
 
     return solver, w_A, w_B, frontier_count
+
+
+def audit_sniper_islands(
+    model: R1CSCircuitModel,
+    timeout_ms: int = 10000,
+    output_poc_path: str = "exploit_poc.json",
+) -> dict:
+    """
+    MODO FRANCOTIRADOR (--sniper):
+    Colapsa todos los subgrafos deterministas (ej. rondas Poseidon/MiMC) mediante
+    Clausura Cuadratica Universal, aisla las islas residuales de seniales no
+    determinadas y ataca cada isla individualmente en Z3.
+    """
+    print("\n" + "=" * 80)
+    log_telemetry("SNIPER_INIT", f"Iniciando Modo Francotirador para circuito: {model.name}")
+    t0 = time.time()
+
+    determined, root_bounded, unresolved = model.compute_forward_algebraic_closure()
+    islands = model.extract_sniper_islands()
+
+    log_telemetry(
+        "SNIPER_CLOSURE",
+        f"Clausura Cuadratica L4: {len(determined)}/{model.num_variables} seniales determinadas | "
+        f"{len(unresolved)} seniales sospechosas en {len(islands)} isla(s).",
+    )
+    print("=" * 80)
+
+    if not islands:
+        elapsed = (time.time() - t0) * 1000.0
+        print("\n" + "-" * 80)
+        log_telemetry("VERDICT", "UNSAT | SOLIDEZ CRIPTOGRAFICA CERTIFICADA (0 ISLAS MALEABLES)")
+        print("-" * 80 + "\n")
+        return {"verdict": "SECURE", "elapsed_ms": elapsed, "conflicts": 0, "decisions": 0}
+
+    for idx, island in enumerate(islands):
+        log_telemetry(
+            "SNIPER_TARGET",
+            f"Disparando Z3 sobre Isla {idx + 1}/{len(islands)} ('{island.name}'): "
+            f"{len(island.constraints)} restricciones locales | Seniales objetivo: {island.output_signals}",
+        )
+        res = audit_witness_uniqueness(
+            island, timeout_ms=timeout_ms, output_poc_path=output_poc_path
+        )
+        if res["verdict"] == "VULNERABLE":
+            return res
+
+    elapsed = (time.time() - t0) * 1000.0
+    return {"verdict": "SECURE", "elapsed_ms": elapsed, "conflicts": 0, "decisions": 0}
 
 
 def audit_witness_uniqueness(
@@ -103,6 +144,9 @@ def audit_witness_uniqueness(
     print("=" * 80)
 
     t0 = time.time()
+
+    # Ejecutar clausura cuadratica preventiva para fijar cadenas deterministas
+    model.compute_forward_algebraic_closure()
 
     if model.output_signals:
         eval_signals = [idx for idx in model.output_signals if 0 < idx < model.num_variables]
@@ -121,9 +165,6 @@ def audit_witness_uniqueness(
     determined_set = set(model.determined_signals)
     unresolved_eval = [s for s in eval_signals if s not in determined_set]
 
-    # Fase 1: Sonda Existencial 1-Dispersa sobre subanillo directo (k = 0)
-    # Linealiza cascadas polinomiales (como arboles de Merkle sub-restringidos)
-    # y encuentra contraejemplos exactos en < 5 ms.
     if unresolved_eval and len(model.constraints) > 1:
         fast_timeout = min(int(timeout_ms), 1500)
         solver_fast, w_A_fast, w_B_fast, frontier_cnt = _build_solver_instance(
@@ -177,7 +218,6 @@ def audit_witness_uniqueness(
                 "exploit_report": report,
             }
 
-    # Fase 2: Formulacion Diofantica Modular Completa sobre F_p
     solver, w_A, w_B, frontier_cnt = _build_solver_instance(
         model,
         eval_signals,
@@ -250,13 +290,19 @@ def audit_witness_uniqueness(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Chronos-ZK Witness Uniqueness Engine")
+    parser = argparse.ArgumentParser(description="Chronos-ZK Witness Uniqueness & Sniper Engine")
     parser.add_argument(
         "--fixture",
         type=str,
-        help="Nombre del fixture (iszero_vulnerable, iszero_secure, num2bits_vulnerable, num2bits_secure, merkle_vulnerable, merkle_secure)",
+        help="Nombre del fixture (iszero_*, num2bits_*, merkle_*, poseidon_div_vulnerable, poseidon_div_secure)",
     )
     parser.add_argument("--ir", type=str, help="Ruta al archivo pruned_ir.json")
+    parser.add_argument("--sym", type=str, default=None, help="Ruta opcional al archivo .sym de Circom")
+    parser.add_argument(
+        "--sniper",
+        action="store_true",
+        help="Activa el Modo Francotirador (Clausura Cuadratica + Micro-Slicing por Isla)",
+    )
     parser.add_argument("--timeout", type=int, default=30000, help="Timeout en milisegundos")
     parser.add_argument(
         "--expect",
@@ -270,13 +316,20 @@ if __name__ == "__main__":
 
     if args.fixture:
         circuit_model = get_fixture_model(args.fixture)
-        res = audit_witness_uniqueness(circuit_model, args.timeout)
+        if args.sym:
+            circuit_model.load_sym_file(args.sym)
     elif args.ir:
-        circuit_model = R1CSCircuitModel.from_json(args.ir)
-        res = audit_witness_uniqueness(circuit_model, args.timeout)
+        circuit_model = R1CSCircuitModel.from_json(args.ir, sym_path=args.sym)
     else:
-        print("Uso: python -m smt_verifier.witness_uniqueness --fixture <nombre> | --ir <path.json>")
+        print(
+            "Uso: python -m smt_verifier.witness_uniqueness --fixture <nombre> | --ir <path.json> [--sym <file.sym>] [--sniper]"
+        )
         sys.exit(1)
+
+    if args.sniper:
+        res = audit_sniper_islands(circuit_model, args.timeout)
+    else:
+        res = audit_witness_uniqueness(circuit_model, args.timeout)
 
     if args.expect and res["verdict"] != args.expect:
         log_telemetry(
