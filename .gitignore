@@ -32,7 +32,6 @@ exploit_poc.json
 telemetry_results.json
 GRANT_BENCHMARK_REPORT.md
 
-BOUNTY_SCAN_REPORT.md
 
 # IDE / Operating System artifacts
 .vscode/
@@ -43,9 +42,18 @@ Thumbs.db
 [Dd]esktop.ini
 .DS_Store
 
+
+
+
+
 # External Benchmarks & Local Workspace Utilities
+BOUNTY_SCAN_REPORT.md
 benchmarks/zkbugs/
 benchmarks/panther-core-vuln/
+benchmarks/self/
+benchmarks/zk-email-verify/
+benchmarks/EncryptedERC/
+benchmarks/iden3-circuits/
 _.txt
 crear_contexto.py
 project_context.txt
